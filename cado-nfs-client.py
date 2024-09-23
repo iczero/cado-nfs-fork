@@ -162,6 +162,18 @@ from workunit import Workunit
 # grab the default SIGINT handler (which raises KeyboardInterrupt)
 sigint_default_handler = signal.getsignal(signal.SIGINT)
 
+# If we receive SIGTERM (the default signal for "kill") while a
+# subprocess is running, we want to be able to terminate the
+# subprocess, too, so that the system is not kept busy with
+# orphaned processes.
+# Python installs by default a signal handler for SIGINT which
+# raises the KeyboardInterrupt exception. This is convenient, as
+# it lets us simply terminate the child in an exception handler.
+# Thus we install the signal handler of SIGINT for SIGTERM as well,
+# so that SIGTERM likewise raises a KeyboardInterrupt exception.
+
+signal.signal(signal.SIGTERM, sigint_default_handler)
+
 def pid_exists(pid):
     try:
         os.kill(pid, 0)
@@ -674,26 +686,16 @@ def run_command(command, stdin=None, print_error=True, **kwargs):
 
     logging.info("Running %s", command_str)
 
+    # we do setsid in child so we can handle Ctrl-C gracefully
     child = subprocess.Popen(command_list,
                              stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE,
                              close_fds=close_fds,
+                             start_new_session=True,
                              **kwargs)
 
     logging.info ("[%s] Subprocess has PID %d", time.asctime(), child.pid)
-
-    # If we receive SIGTERM (the default signal for "kill") while a
-    # subprocess is running, we want to be able to terminate the
-    # subprocess, too, so that the system is not kept busy with
-    # orphaned processes.
-    # Python installs by default a signal handler for SIGINT which
-    # raises the KeyboardInterrupt exception. This is convenient, as
-    # it lets us simply terminate the child in an exception handler.
-    # Thus we install the signal handler of SIGINT for SIGTERM as well,
-    # so that SIGTERM likewise raises a KeyboardInterrupt exception.
-
-    signal.signal(signal.SIGTERM, sigint_default_handler)
 
     # Wait for command to finish executing, capturing stdout and stderr
     # in output tuple
@@ -707,9 +709,6 @@ def run_command(command, stdin=None, print_error=True, **kwargs):
         logging.error("[%s] Terminated command resulted in exit code %d",
             time.asctime(), child.returncode)
         raise # Re-raise KeyboardInterrupt to terminate cado-nfs-client.py
-
-    # Un-install our handler and revert to the default handler
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
     if print_error and child.returncode != 0:
         logging.error("Command resulted in exit code %d", child.returncode)
@@ -839,8 +838,8 @@ class HTTP_connector(object):
             if hard_error and self.exit_on_server_gone:
                 raise ServerGone()
             raise
-        logging.info("_native_get_file(%s) -> %s" % (url, dlpath))
-        logging.info("fd = %d" % fd)
+        logging.info("_native_get_file(%s) -> %s", url, dlpath)
+        logging.info("fd = %d", fd)
         outfile = os.fdopen(fd, "wb")
         FileLock.lock(outfile, exclusive=True)
         logging.info("lock acquired")
@@ -1834,7 +1833,7 @@ class InputDownloader(object):
                               "indicate that two clients "
                               "with clientid '%s' are "
                               "running. Terminating.",
-                              self.wu_filename, clientid)
+                              wu_path, clientid)
                 raise
             # otherwise the WU constructor itself failed.
             except Exception as err:
@@ -2063,7 +2062,7 @@ class ResultUploaderThread(threading.Thread):
             default_wait = retry_wait
 
         while True:
-            if self.uploader.should_quit:
+            if self.should_quit:
                 break
 
             # try not to spam retries too hard
@@ -2079,6 +2078,8 @@ class ResultUploaderThread(threading.Thread):
             if len(self.uploader.upload_backlog) > 0:
                 # new upload arrived
                 continue
+            if self.should_quit:
+                break
 
             if len(self.uploader.to_retry) > 0:
                 self.uploader.queue_event.wait(retry_wait)
@@ -2164,7 +2165,7 @@ class WorkunitClient(object):
         bad_wu_counter = 0
         exit_on_complete = False
 
-        def on_sigint():
+        def on_sigint(_signum, _frame):
             nonlocal exit_on_complete
             logging.info("SIGINT received, exiting upon WU completion (hit ^C again to exit)")
             exit_on_complete = True
@@ -2195,8 +2196,9 @@ class WorkunitClient(object):
                 logging.info("Client processed its WU."
                             " Finishing now as implied by --single")
                 return 0
-            elif exit_on_complete:
+            if exit_on_complete:
                 logging.info("WU finished, exiting as requested (SIGINT)")
+                return 0
 
 class ThreadedWorkunitClient(threading.Thread):
     def __init__(self, settings, downloader, uploader, thread_idx):
@@ -2249,6 +2251,10 @@ class ThreadedWorkunitClient(threading.Thread):
         return True
     
     def run(self):
+        logging.info("Starting client %s", self.clientid)
+        client_ok = True
+        bad_wu_counter = 0
+
         while client_ok:
             try:
                 client_ok = client.process()
@@ -2271,6 +2277,7 @@ class ThreadedWorkunitClient(threading.Thread):
 
             if self.should_quit:
                 logging.info("Client %s WU finished, exiting as requested", self.clientid)
+                return
 # }}}
 
 # Settings which we require on the command line (no defaults)
@@ -2320,7 +2327,6 @@ OPTIONAL_SETTINGS = {
                         "File to which to write log output. "
                         "In daemon mode, if no file is specified, a "
                         "default of <workdir>/<clientid>.log is used"),
-    "PARALLEL"       : (None, "How many workunits to run in parallel"),
     }
 # Merge the two, removing help string
 def merge_two_dicts(x, y):
@@ -2384,6 +2390,8 @@ if __name__ == '__main__':
                                " Note that REGEXP cannot start with a dash")
         parser.add_option("--logdate", default=True, action='store_true',
                           help="Include ISO8601 format date in logging")
+        parser.add_option("--parallel", type=int,
+                          help="How many workunits to run in parallel")
 
         # Parse command line
         (options, args) = parser.parse_args()
@@ -2430,7 +2438,7 @@ if __name__ == '__main__':
                 raise ValueError("--ping requires --daemon or --logfile")
     # If no client id is given, we use <hostname>.<randomstr>
     if SETTINGS["CLIENTID"] is None:
-        if SETTINGS["PARALLEL"] is None:
+        if options.parallel is None:
             import random
             hostname = socket.gethostname()
             random.seed()
@@ -2442,7 +2450,7 @@ if __name__ == '__main__':
     # If no working directory is given, we use <clientid>.work/
     if SETTINGS["WORKDIR"] is None:
         SETTINGS["WORKDIR"] = SETTINGS["CLIENTID"] + '.work/'
-    elif SETTINGS["PARALLEL"] is not None:
+    elif options.parallel is not None:
         logging.warning("workdir is ignored when parallel is specified, please set basepath instead")
     if SETTINGS["BASEPATH"] is not None:
         SETTINGS["WORKDIR"] = os.path.join(SETTINGS["BASEPATH"],
@@ -2452,7 +2460,7 @@ if __name__ == '__main__':
     # If no WU filename is given, we use "WU." + client id
     if SETTINGS["WU_FILENAME"] is None:
         SETTINGS["WU_FILENAME"] = "WU." + SETTINGS["CLIENTID"]
-    elif SETTINGS["PARALLEL"] is not None:
+    elif options.parallel is not None:
         logging.warning("wu-filename is ignored when parallel is specified")
 
     SETTINGS["KEEPOLDRESULT"] = options.keepoldresult
@@ -2461,7 +2469,7 @@ if __name__ == '__main__':
     SETTINGS["OVERRIDE"] = options.override
     SETTINGS["SINGLE"] = options.single
     SETTINGS["EXIT_ON_SERVER_GONE"] = options.exit_on_server_gone
-    SETTINGS["PARALLEL"] = options.parallel
+    options.parallel = options.parallel
 
     # Create download and working directories if they don't exist
     if not os.path.isdir(SETTINGS["DLDIR"]):
@@ -2523,7 +2531,7 @@ if __name__ == '__main__':
 
     uploader = ResultUploader(SETTINGS, connector)
 
-    if SETTINGS["PARALLEL"] is None:
+    if options.parallel is None:
         # run client, then exit
         client = WorkunitClient(SETTINGS, downloader, uploader)
         exit_code = client.run(options.single)
@@ -2534,13 +2542,15 @@ if __name__ == '__main__':
     uploader_thread = ResultUploaderThread(uploader)
     uploader_thread.start()
 
-    for thread_idx in range(SETTINGS["PARALLEL"]):
+    for thread_idx in range(options.parallel):
         client = ThreadedWorkunitClient(SETTINGS, downloader, uploader, thread_idx)
+        clients.append(client)
+        makedirs(client.workdir, exist_ok=True)
         client.start()
 
     # TODO: parallel
     # TODO: make workdir after spawning parallel client
-    def on_sigint():
+    def on_sigint(_signum, _frame):
         logging.info("SIGINT received, exiting upon WU completion (hit ^C again to exit)")
         for client in clients:
             client.shutdown()
