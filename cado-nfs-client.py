@@ -8,6 +8,9 @@
 # pylint: disable=too-few-public-methods
 # pylint: disable=import-error
 # pylint: disable=wrong-import-position
+# pylint: disable=missing-module-docstring
+# pylint: disable=missing-class-docstring
+# pylint: disable=missing-function-docstring
 
 # {{{ libs
 import sys
@@ -24,8 +27,11 @@ import hashlib
 import logging
 import socket
 import signal
+import threading
+import math
 import re
 import base64
+from collections import deque
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -33,6 +39,7 @@ import email.encoders
 import email.generator
 from string import Template
 from io import BytesIO
+from pathlib import Path
 import ssl
 import urllib.request as urllib_request
 import urllib.error as urllib_error
@@ -156,6 +163,20 @@ sys.path.append(pathdict["pylib"])
 from workunit import Workunit
 # }}}
 
+# grab the default SIGINT handler (which raises KeyboardInterrupt)
+sigint_default_handler = signal.getsignal(signal.SIGINT)
+
+# If we receive SIGTERM (the default signal for "kill") while a
+# subprocess is running, we want to be able to terminate the
+# subprocess, too, so that the system is not kept busy with
+# orphaned processes.
+# Python installs by default a signal handler for SIGINT which
+# raises the KeyboardInterrupt exception. This is convenient, as
+# it lets us simply terminate the child in an exception handler.
+# Thus we install the signal handler of SIGINT for SIGTERM as well,
+# so that SIGTERM likewise raises a KeyboardInterrupt exception.
+
+signal.signal(signal.SIGTERM, sigint_default_handler)
 
 def pid_exists(pid):
     try:
@@ -669,27 +690,22 @@ def run_command(command, stdin=None, print_error=True, **kwargs):
 
     logging.info("Running %s", command_str)
 
+    # we do setsid in child so we can handle Ctrl-C gracefully
     child = subprocess.Popen(command_list,
                              stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE,
                              close_fds=close_fds,
+                             start_new_session=True,
                              **kwargs)
 
     logging.info ("[%s] Subprocess has PID %d", time.asctime(), child.pid)
-
-    # If we receive SIGTERM (the default signal for "kill") while a
-    # subprocess is running, we want to be able to terminate the
-    # subprocess, too, so that the system is not kept busy with
-    # orphaned processes.
-    # Python installs by default a signal handler for SIGINT which
-    # raises the KeyboardInterrupt exception. This is convenient, as
-    # it lets us simply terminate the child in an exception handler.
-    # Thus we install the signal handler of SIGINT for SIGTERM as well,
-    # so that SIGTERM likewise raises a KeyboardInterrupt exception.
-
-    sigint_handler = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGTERM, sigint_handler)
+    # "thread-local storage"
+    current_thread = threading.current_thread()
+    if isinstance(current_thread, ThreadedWorkunitClient):
+        current_thread._current_process = child
+    else:
+        current_thread = None
 
     # Wait for command to finish executing, capturing stdout and stderr
     # in output tuple
@@ -703,9 +719,9 @@ def run_command(command, stdin=None, print_error=True, **kwargs):
         logging.error("[%s] Terminated command resulted in exit code %d",
             time.asctime(), child.returncode)
         raise # Re-raise KeyboardInterrupt to terminate cado-nfs-client.py
-
-    # Un-install our handler and revert to the default handler
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    finally:
+        current_thread._current_process = None
+        current_thread._terminate_if_requested()
 
     if print_error and child.returncode != 0:
         logging.error("Command resulted in exit code %d", child.returncode)
@@ -759,7 +775,6 @@ class HTTP_connector(object):
             context.check_hostname = bool(check_hostname)
             context.load_verify_locations(cafile=cafile)
 
-            logging.info ("urllib_request.urlopen")
             return urllib_request.urlopen(request, context=context)
 
         # If we are not using HTTPS, we can just let urllib do it,
@@ -773,10 +788,8 @@ class HTTP_connector(object):
         hard_error = False
         check_hostname = not self.no_cn_check
         try:
-            logging.info("_urlopen_maybe_https")
             conn = HTTP_connector._urlopen_maybe_https(request, cafile=cafile,
                                                        check_hostname=check_hostname)
-            logging.info("_urlopen_maybe_https returns")
             # conn is a file-like object with additional methods:
             # geturl(), info(), getcode()
             return conn, None, None
@@ -799,7 +812,6 @@ class HTTP_connector(object):
                 hard_error = None
         except urllib_error.URLError as error:
             error_str = "URL error: %s" % str(error)
-            current_error = error.errno
             if error.errno is not None:
                 hard_error = (error.errno == errno.ECONNREFUSED or \
                               error.errno == errno.ECONNRESET)
@@ -839,8 +851,8 @@ class HTTP_connector(object):
             if hard_error and self.exit_on_server_gone:
                 raise ServerGone()
             raise
-        logging.info("_native_get_file(%s) -> %s" % (url, dlpath))
-        logging.info("fd = %d" % fd)
+        logging.info("_native_get_file(%s) -> %s", url, dlpath)
+        logging.info("fd = %d", fd)
         outfile = os.fdopen(fd, "wb")
         FileLock.lock(outfile, exclusive=True)
         logging.info("lock acquired")
@@ -1115,7 +1127,9 @@ class ServerPool(object): # {{{
 # {{{ WorkunitProcessor: this object processes once workunit, and owns
 # the result files until they get collected by the server.
 class WorkunitProcessor(object):
-    def __init__(self, workunit, settings):
+    def __init__(self, workunit, settings, clientid, workdir):
+        self.clientid = clientid
+        self.workdir = workdir
         self.settings = settings
         self.origin = workunit.get_peer()
         self.workunit = workunit
@@ -1219,10 +1233,10 @@ class WorkunitProcessor(object):
 
         # To which directory do workunit files map?
         dirs = {"FILE": self.settings["DLDIR"],
-                "RESULT": self.settings["WORKDIR"],
-                "STDOUT": self.settings["WORKDIR"],
-                "STDERR": self.settings["WORKDIR"],
-                "STDIN": self.settings["WORKDIR"],
+                "RESULT": self.workdir,
+                "STDOUT": self.workdir,
+                "STDERR": self.workdir,
+                "STDIN": self.workdir,
                 }
 
         for key in dirs:
@@ -1304,7 +1318,7 @@ class WorkunitProcessor(object):
         if self.workunit.get("RESULT", None) is None:
             return False
         for filename in self.workunit.get("RESULT", []):
-            filepath = os.path.join(self.settings["WORKDIR"], filename)
+            filepath = os.path.join(self.workdir, filename)
             if not os.path.isfile(filepath):
                 logging.info("Result file %s does not exist", filepath)
                 return False
@@ -1316,7 +1330,7 @@ class WorkunitProcessor(object):
         ''' Delete uploaded result files and files from DELETE lines '''
         logging.info("Cleaning up for workunit %s", self.workunit.get_id())
         for filename in self.workunit.get("RESULT", []):
-            filepath = os.path.join(self.settings["WORKDIR"], filename)
+            filepath = os.path.join(self.workdir, filename)
             logging.info("Removing result file %s", filepath)
             try:
                 os.remove(filepath)
@@ -1325,7 +1339,7 @@ class WorkunitProcessor(object):
                 # on.
                 logging.error("Could not remove file: %s", err)
         for filename in self.workunit.get("DELETE", []):
-            filepath = os.path.join(self.settings["WORKDIR"], filename)
+            filepath = os.path.join(self.workdir, filename)
             logging.info("Removing file %s", filepath)
             os.remove(filepath)
 
@@ -1335,13 +1349,13 @@ class WorkunitProcessor(object):
         mimedata = WuMIMEMultipart()
         # Build a multi-part MIME document containing the WU id and result file
         mimedata.attach_key("WUid", self.workunit.get_id())
-        mimedata.attach_key("clientid", self.settings["CLIENTID"])
+        mimedata.attach_key("clientid", self.clientid)
         if self.errorcode:
             mimedata.attach_key("errorcode", self.errorcode)
         if not self.failedcommand is None:
             mimedata.attach_key("failedcommand", self.failedcommand)
         for filename in self.workunit.get("RESULT", []):
-            filepath = os.path.join(self.settings["WORKDIR"], filename)
+            filepath = os.path.join(self.workdir, filename)
             logging.info("Attaching file %s to upload", filepath)
             mimedata.attach_file("results", filename, filepath, "RESULT")
         for name in self.stdio:
@@ -1441,7 +1455,7 @@ class WorkunitWrapper(Workunit):
 #         # normal __str__ for workunits prints the text in full. In truth,
 #         # we don't need it.
 #         return self.get_id()
-# 
+#
     def get_peer(self):
         return self.peer
 
@@ -1478,11 +1492,15 @@ class InputDownloader(object):
         self.settings = settings
         self.server_pool = server_pool
         self.connector = connector
-        self.wu_filename = os.path.join(self.settings["DLDIR"],
-                                        self.settings["WU_FILENAME"])
         self.wu_backlog = []
         self.wu_backlog_alt = []
         self.exit_on_server_gone = self.settings["EXIT_ON_SERVER_GONE"]
+
+        # In general, if we're running a lot of clients on a single host, it probably
+        # isn't very productive to fetch multiple workunits in parallel, especially
+        # if the server currently doesn't have any available workunits. Instead we
+        # just put the downloader behind a mutex so workunits are fetched one at a time.
+        self.lock = threading.Lock()
 
     # {{{ download -- this goes through several steps.
     @staticmethod
@@ -1515,7 +1533,8 @@ class InputDownloader(object):
             options=None,
             is_wu=False,
             executable=False,
-            mandatory_server=None):
+            mandatory_server=None,
+            cancel_hook=None):
         """ gets a file from the server (of from one of the failover
         servers, for WUs), and wait until we succeed.
 
@@ -1555,8 +1574,13 @@ class InputDownloader(object):
         if dlpath is None:
             dlpath_tmp = None
         else:
-            dlpath_tmp = "%s%d" % (dlpath, random.randint(0,2**30)^os.getpid())
+            dlpath_tmp = "%s.tmp%d" % (dlpath, random.randint(0,2**30)^os.getpid())
         while True:
+            if callable(cancel_hook) and cancel_hook():
+                # caller can handle cancel and wants us to cancel
+                logging.info("caller requested cancel")
+                return None
+
             logging.info("spin=%d is_wu=%s blog=%d", spin, is_wu,
                     len(self.wu_backlog)+len(self.wu_backlog_alt))
             if cap and spin > max_loops:
@@ -1580,7 +1604,7 @@ class InputDownloader(object):
                 break
 
             if hard_error and self.exit_on_server_gone and self.server_pool.current_server_was_successful_once():
-                logging.error(f"Disabling {current_server} because of --exit-on-server-gone")
+                logging.error("Disabling %s because of --exit-on-server-gone", current_server)
                 try:
                     self.server_pool.disable_server(current_server)
                 except NoMoreServers:
@@ -1600,7 +1624,20 @@ class InputDownloader(object):
                 connfailed += 1
             else:
                 connfailed = 0
-            
+
+            # the error is expected (e.g. "No work available"), do not increment failure counter
+            normal_error = False
+
+            # TODO: is there a less bad way to do this?
+            if not hard_error and is_wu and 'No work available' in error_str:
+                normal_error = True
+                if waiting_since < 3:
+                    # retry a few times for more work
+                    logging.info("Waiting for server to add more workunits...")
+                    time.sleep(1)
+                    waiting_since += 1
+                    continue
+
             if givemsg:
                 logging.error("Download failed%s, %s",
                               " with hard error" if hard_error else "",
@@ -1625,7 +1662,7 @@ class InputDownloader(object):
                 continue
 
             # 4 means that we'll try 5 times.
-            if waiting_since >= 4 * wait:
+            if waiting_since >= 4 * wait and not normal_error:
                 if mandatory_server is None:
                     current_server = self.server_pool.change_server()
                     spin += 1
@@ -1664,8 +1701,8 @@ class InputDownloader(object):
                          options=None,
                          is_wu=False,
                          executable=False,
-                         mandatory_server=None
-                         ):
+                         mandatory_server=None,
+                         cancel_hook=None):
         """ Downloads a file if it does not exist already, from one of
         the servers configured for failover.
 
@@ -1735,7 +1772,8 @@ class InputDownloader(object):
             peer = self.get_file(urlpath, filename, options=options,
                                  is_wu=is_wu,
                                  executable=executable,
-                                 mandatory_server=mandatory_server)
+                                 mandatory_server=mandatory_server,
+                                 cancel_hook=cancel_hook)
             if peer is None:
                 if is_wu:
                     return None
@@ -1791,7 +1829,7 @@ class InputDownloader(object):
 
     # }}}
 
-    def _get_fresh_wu(self):
+    def _get_fresh_wu(self, clientid, wu_path, cancel_hook):
         """
         returns a WorkunitWrapper.  We don't know whether the companion
         files are present at this point. There is still a possibility
@@ -1803,15 +1841,16 @@ class InputDownloader(object):
         while True:
             # Download the WU file if none exists
             url = self.settings["GETWUPATH"]
-            options = "clientid=" + self.settings["CLIENTID"]
+            options = "clientid=" + clientid
             # we could maybe add more options, like architecture, qrange
             # size, whatnot.
 
             # will not throw, or maybe NoMoreServers
             peer = self.get_missing_file(url,
-                                         self.wu_filename,
+                                         wu_path,
                                          options=options,
-                                         is_wu=True)
+                                         is_wu=True,
+                                         cancel_hook=cancel_hook)
 
             if peer is None:
                 # could not download a WU...
@@ -1821,14 +1860,14 @@ class InputDownloader(object):
             # workunit
             try:
                 real_peer = peer
-                workunit = WorkunitWrapper(self.wu_filename, real_peer)
+                workunit = WorkunitWrapper(wu_path, real_peer)
             except FileLockedException:
                 # this one is fatal.
                 logging.error("File '%s' is already locked. This may "
                               "indicate that two clients "
                               "with clientid '%s' are "
                               "running. Terminating.",
-                              self.wu_filename, self.settings["CLIENTID"])
+                              wu_path, clientid)
                 raise
             # otherwise the WU constructor itself failed.
             except Exception as err:
@@ -1851,7 +1890,7 @@ class InputDownloader(object):
 
         return workunit
 
-    def _get_wu(self):
+    def _get_wu(self, clientid, wu_path_fresh, cancel_hook):
         if self.wu_backlog:
             logging.info("Current backlog of half-downloaded WUs: %s",
                     ", ".join([w.get_id() for w in self.wu_backlog]))
@@ -1869,20 +1908,25 @@ class InputDownloader(object):
                 logging.info("Re-attempting previously downloaded workunit %s",
                              workunit.get_id())
                 return workunit
-        return self._get_fresh_wu()
+        return self._get_fresh_wu(clientid, wu_path_fresh, cancel_hook)
 
-    def get_wu_full(self):
+    def _get_wu_full_inner(self, clientid, wu_filename_fresh, cancel_hook):
         """
         returns a workunit object, together with the identification of
         the origin server, and an exclusive file handle on the WU.
         All companion files of the workunit object are
         guaranteed to be there when this function returns.
+        Note: the cancel_hook should always return True after it first returns True
         """
 
         self.wu_backlog_alt = []
+        wu_path_fresh = os.path.join(self.settings["DLDIR"], wu_filename_fresh)
         while True:
-            workunit = self._get_wu()
+            workunit = self._get_wu(clientid, wu_path_fresh, cancel_hook)
             if workunit is None:
+                if callable(cancel_hook) and cancel_hook():
+                    return None
+
                 self.wu_backlog += self.wu_backlog_alt
                 self.wu_backlog_alt = []
                 continue
@@ -1896,8 +1940,9 @@ class InputDownloader(object):
             except WorkunitClientHalfDownload as ex:
                 logging.error(ex)
                 try:
-                    if workunit.get_filename() == self.wu_filename:
+                    if workunit.get_filename() == wu_path_fresh:
                         workunit.move_to_server_private_file()
+
                     # Important: do not append right now, or we're in for
                     # an infinite loop
                     self.wu_backlog_alt.append(workunit)
@@ -1908,27 +1953,38 @@ class InputDownloader(object):
         self.wu_backlog += self.wu_backlog_alt
         self.wu_backlog_alt = []
         return workunit
+
+    def get_wu_full(self, clientid, wu_filename_fresh, cancel_hook = None):
+        "Get a workunit with exclusive lock"
+        self.lock.acquire()
+        try:
+            return self._get_wu_full_inner(clientid, wu_filename_fresh, cancel_hook)
+        finally:
+            self.lock.release()
 # }}}
 
 # {{{ ResultUploader -- persistent class that handles uploads
 
 class ResultUploader(object):
-    def __init__(self, settings, server_pool, connector):
+    def __init__(self, settings, connector):
         self.settings = settings
-        self.server_pool = server_pool
         self.connector = connector
         self.nservers = len(settings["SERVER"])
-        self.upload_backlog = [[] for i in range(self.server_pool.nservers)]
-        self.backlog_size = 0
-        self.last_active = 0
+        self.upload_backlog = deque()
+        self.queue_event = threading.Event()
+        self.to_retry = deque()
 
     def schedule_upload(self, processor):
         """ takes a WorkunitProcessor object
         """
-        idx = processor.workunit.get_peer().get_index()
-        self.upload_backlog[idx].append(processor)
-        self.backlog_size += 1
-        self.last_active = idx
+        # idx = processor.workunit.get_peer().get_index()
+        self.upload_backlog.append(processor)
+        self.queue_event.set()
+
+    def retry_all(self):
+        "re-queue all previously errored uploads"
+        self.upload_backlog.extend(self.to_retry)
+        self.to_retry.clear()
 
     @staticmethod
     def get_content_charset(conn):
@@ -1943,48 +1999,45 @@ class ResultUploader(object):
             charset = "latin-1"
         return charset
 
-    def process_uploads(self):
-        if self.backlog_size == 0:
+    def process_uploads(self, dedicated_thread = False):
+        if len(self.upload_backlog) == 0:
             return
 
         logging.info("Uploading results: backlog has %d entries",
-                     self.backlog_size)
-        for u in self.upload_backlog:
-            for p in u:
-                logging.info("\t%s  -->  %s",
-                             p.workunit.get_id(),
-                             p.workunit.get_peer())
-        mention_each = self.backlog_size > 1
+                     len(self.upload_backlog))
 
         wait = float(self.settings["DOWNLOADRETRY"])
-        # Now try to purge our backlog, starting from the server we've
-        # just got this WU from.
-        did_progress = False
-        last_error = ""
-        for i in range(self.nservers):
-            index = (self.last_active + i) % self.server_pool.nservers
-            old_backlog = self.upload_backlog[index]
-            new_backlog = []
-            for p in old_backlog:
-                if p.workunit.is_stale():
-                    logging.error("Workunit %s has expired, not uploading",
-                                  p.workunit.get_id())
-                    p.cleanup()
-                    continue
-                if mention_each:
-                    logging.info("Attempt: %s  -->  %s",
-                                 p.workunit.get_id(),
-                                 p.workunit.get_peer())
-                request, cafile = p.get_answer()
-                url = request.get_full_url()
-                conn = None
-                waiting_since = 0
-                while True:
-                    conn, error_str, hard_error = self.connector._urlopen(
-                        request, cafile=cafile)
-                    if conn:
-                        break
-                    logging.error("Upload failed, %s", error_str)
+
+        if not dedicated_thread:
+            self.retry_all()
+            # in dedicated_thread mode, the executor handles retry
+
+        while True:
+            try:
+                p = self.upload_backlog.popleft()
+            except IndexError:
+                # unfortunately this seems like the only way to atomically test
+                # for an empty queue
+                break
+            if p.workunit.is_stale():
+                logging.error("Workunit %s has expired, not uploading",
+                              p.workunit.get_id())
+                p.cleanup()
+                continue
+            logging.info("Attempt: %s  -->  %s",
+                         p.workunit.get_id(),
+                         p.workunit.get_peer())
+            request, cafile = p.get_answer()
+            url = request.get_full_url()
+            conn = None
+            waiting_since = 0
+            while True:
+                conn, error_str, hard_error = self.connector._urlopen(
+                    request, cafile=cafile)
+                if conn:
+                    break
+                logging.error("Upload failed, %s", error_str)
+                if not dedicated_thread:
                     if waiting_since > 0:
                         logging.error("Waiting %s seconds before retrying"
                                       " (I have been waiting for %s seconds)",
@@ -1997,60 +2050,121 @@ class ResultUploader(object):
                     if waiting_since >= 4 * wait:
                         logging.error("Giving up on this upload,"
                                       " will retry later")
-                        new_backlog.append(p)
+                        self.to_retry.append(p)
                         break
-                if not conn:
-                    # we've appended p to the new backlog at this point.
-                    continue
-                if p.workunit.is_stale():
-                    # maybe it went stale since last time we checked.
-                    logging.error("Workunit %s has expired, not uploading",
-                                  p.workunit.get_id())
-                    p.cleanup()
-                    conn.close()
-                    continue
-                if waiting_since > 0:
-                    logging.info("Opened URL %s after %s seconds wait",
-                                 url, waiting_since)
-                response = conn.read()
-                encoding = self.get_content_charset(conn)
-                response_str = response.decode(encoding=encoding)
-                logging.debug("Server response:\n%s", response_str)
-                conn.close()
-                did_progress = True
-                logging.info("Upload of %s succeeded.", p.workunit.get_id())
-                p.cleanup()
-            self.backlog_size -= len(old_backlog) - len(new_backlog)
-            self.upload_backlog[index] = new_backlog
+                else:
+                    # just wait until we are woken up again
+                    logging.error("... will try again later")
+                    self.to_retry.append(p)
+                    break
+            if not conn:
+                # we've appended p to the new backlog at this point.
+                continue
+            if waiting_since > 0:
+                logging.info("Opened URL %s after %s seconds wait",
+                             url, waiting_since)
+            response = conn.read()
+            encoding = self.get_content_charset(conn)
+            response_str = response.decode(encoding=encoding)
+            logging.debug("Server response:\n%s", response_str)
+            conn.close()
+            logging.info("Upload of %s succeeded.", p.workunit.get_id())
+            p.cleanup()
 
         # We could return "did_progress", but alas, returning False will
         # cause the client to exit. We'd rather arrange to have our
         # backlog grow.
 
+class ResultUploaderThread(threading.Thread):
+    def __init__(self, uploader: ResultUploader):
+        super().__init__(name="Result Uploader Thread")
+        self.uploader = uploader
+        self.should_quit = False
+
+    def shutdown(self):
+        self.should_quit = True
+        self.uploader.queue_event.set()
+
+    # used only when the ResultUploader is running in its own thread
+    def run(self):
+        logging.info("Started result uploader thread")
+        retry_wait = float(self.uploader.settings["DOWNLOADRETRY"])
+        default_wait = 180.0
+        if default_wait < retry_wait:
+            default_wait = retry_wait
+
+        while True:
+            if self.should_quit:
+                break
+
+            # try not to spam retries too hard
+            retry_count = math.ceil(len(self.uploader.to_retry) ** 0.6)
+            if retry_count > 0:
+                logging.info("Retrying %d uploads", retry_count)
+            for _ in range(retry_count):
+                self.uploader.upload_backlog.append(self.uploader.to_retry.popleft())
+
+            self.uploader.process_uploads(dedicated_thread=True)
+
+            self.uploader.queue_event.clear()
+            if len(self.uploader.upload_backlog) > 0:
+                # new upload arrived
+                continue
+            if self.should_quit:
+                break
+
+            if len(self.uploader.to_retry) > 0:
+                self.uploader.queue_event.wait(retry_wait)
+            else:
+                self.uploader.queue_event.wait(default_wait)
+
+        # we were told to exit, do final retry
+        # we shouldn't receive any new jobs at this point
+        last_retry_count = 0
+        while last_retry_count < 10:
+            last_retry_count += 1
+            self.uploader.retry_all()
+            self.uploader.process_uploads(dedicated_thread=True)
+
+            # everything should either be done or in to_retry
+            assert len(self.uploader.upload_backlog) == 0
+
+            if len(self.uploader.to_retry) == 0:
+                break
+
+            time.sleep(5)
+
+        if len(self.uploader.to_retry) > 0:
+            logging.error("Giving up on %d uploads:", len(self.uploader.to_retry))
+            for p in self.uploader.to_retry:
+                logging.info("\t%s  -->  %s",
+                             p.workunit.get_id(),
+                             p.workunit.get_peer())
+        else:
+            logging.info("All uploads succeeded, exiting uploader thread")
 # }}}
 
 # {{{ WorkunitClient -- gets one WU, runs it, schedules its upload.
 class WorkunitClient(object):
-    def __init__(self, settings, server_pool, downloader, uploader):
-        self.server_pool = server_pool
+    def __init__(self, settings, downloader, uploader):
         self.downloader = downloader
         self.uploader = uploader
         self.settings = settings
         self.workunit = None
-        self.exit_on_server_gone = settings["EXIT_ON_SERVER_GONE"]
 
     def have_terminate_request(self):
         return self.workunit.get("TERMINATE", None) is not None
 
     def process(self):
-        self.workunit = downloader.get_wu_full()
+        self.workunit = self.downloader.get_wu_full(self.settings["CLIENTID"], self.settings["WU_FILENAME"])
 
         if self.have_terminate_request():
             self.workunit.cleanup()
             logging.info("Received TERMINATE, exiting")
             return False
 
-        processor = WorkunitProcessor(self.workunit, self.settings)
+        processor = WorkunitProcessor(self.workunit, self.settings, self.settings["CLIENTID"],
+                                      self.settings["WORKDIR"])
         # TODO: a select loop, maybe ? We could handle the pending
         # uploads, maybe.
         processor.run_commands()
@@ -2077,6 +2191,145 @@ class WorkunitClient(object):
         self.workunit = None
 
         return True
+
+    def run(self, single = False):
+        client_ok = True
+        bad_wu_counter = 0
+        exit_on_complete = False
+
+        def on_sigint(_signum, _frame):
+            nonlocal exit_on_complete
+            logging.info("SIGINT received, exiting upon WU completion (hit ^C again to exit)")
+            exit_on_complete = True
+            # restore original handler to exit immediately
+            signal.signal(signal.SIGINT, sigint_default_handler)
+
+        signal.signal(signal.SIGINT, on_sigint)
+
+        while client_ok:
+            try:
+                client_ok = self.process()
+            except WorkunitParseError:
+                bad_wu_counter += 1
+                if bad_wu_counter > BAD_WU_MAX:
+                    logging.critical("Had %d bad workunit files. Aborting.", bad_wu_counter)
+                    return 1
+                continue
+            except NoMoreServers as e:
+                logging.error(e)
+                return 1
+            except WorkunitClientToFinish as e:
+                logging.info("Client finishing: %s. Bye.", e)
+                return 0
+            except ServerGone as e:
+                return 0
+
+            if single:
+                logging.info("Client processed its WU."
+                            " Finishing now as implied by --single")
+                return 0
+            if exit_on_complete:
+                logging.info("WU finished, exiting as requested (SIGINT)")
+                return 0
+
+class ThreadedWorkunitClient(threading.Thread):
+    def __init__(self, settings, downloader, uploader, thread_idx):
+        clientid_base = settings["CLIENTID"]
+        self.clientid = f"{clientid_base}.p{thread_idx}"
+        self.thread_idx = thread_idx
+        super().__init__(name="Worker " + self.clientid)
+        self.workdir = os.path.join(SETTINGS["BASEPATH"], self.clientid + '.work/')
+        self.downloader = downloader
+        self.uploader = uploader
+        self.settings = settings
+        self.workunit = None
+        self.should_quit = False
+        self.set_affinity = None
+        # set by run_command if the current thread is a ThreadedWorkunitClient
+        self._current_process = None
+        # set True to raise KeyboardInterrupt to whoever checks
+        self._terminate_immediately = False
+
+    def shutdown(self):
+        self.should_quit = True
+
+    def _terminate_if_requested(self):
+        assert threading.current_thread() is self
+        if self._terminate_immediately:
+            raise KeyboardInterrupt()
+
+    def have_terminate_request(self):
+        return self.workunit.get("TERMINATE", None) is not None
+
+    def process(self):
+        self.workunit = self.downloader.get_wu_full(self.clientid, f"WU.{self.clientid}",
+                                                    lambda: self.should_quit)
+
+        if self.workunit is None and self.should_quit:
+            # cancelled while fetching new workunit
+            return False
+
+        if self.have_terminate_request():
+            self.workunit.cleanup()
+            logging.info("Client %s received TERMINATE, exiting", self.clientid)
+            return False
+
+        processor = WorkunitProcessor(self.workunit, self.settings, self.clientid, self.workdir)
+        processor.run_commands()
+        # to check the return value of the above command, change the previous
+        # line to ret = processor.run_commands(), and there is an error if
+        # ret is false (if not ret).
+        # Then we can search for a particular string in stderr as follows:
+        # ret = processor.run_commands()
+        # if not ret and re.search("xyx", str(processor.stdio["stderr"][0])):
+        #    output_something_to_some_log_file
+        #    sys.exit(1)
+        # this is useful if a given error always happens on a given machine
+
+        processor.prepare_answer()
+
+        # Transfer ownership of "processor" to the schedule_upload
+        # control flow.
+        self.uploader.schedule_upload(processor)
+
+        self.workunit.cleanup()
+        self.workunit = None
+
+        return True
+
+    def run(self):
+        logging.info("Starting client %s", self.clientid)
+
+        # processes forked off from the current thread will inherit the CPU set
+        if self.set_affinity is not None:
+            os.sched_setaffinity(0, self.set_affinity)
+
+        client_ok = True
+        bad_wu_counter = 0
+
+        while client_ok:
+            try:
+                client_ok = self.process()
+            except WorkunitParseError:
+                bad_wu_counter += 1
+                if bad_wu_counter > BAD_WU_MAX:
+                    logging.critical("Client %s had %d bad workunit files. Aborting.",
+                                     self.clientid, bad_wu_counter)
+                    return
+                continue
+            except NoMoreServers as e:
+                logging.error(e)
+                return
+            except WorkunitClientToFinish as e:
+                logging.info("Client %s finishing: %s. Bye.", self.clientid, e)
+                return
+            except ServerGone as e:
+                logging.info("Client %s server gone: %s, exiting", self.clientid, e)
+                return
+
+            if self.should_quit:
+                logging.info("Client %s WU finished, exiting as requested", self.clientid)
+                return
 # }}}
 
 # Settings which we require on the command line (no defaults)
@@ -2125,7 +2378,7 @@ OPTIONAL_SETTINGS = {
     "LOGFILE"        : (None,
                         "File to which to write log output. "
                         "In daemon mode, if no file is specified, a "
-                        "default of <workdir>/<clientid>.log is used")
+                        "default of <workdir>/<clientid>.log is used"),
     }
 # Merge the two, removing help string
 def merge_two_dicts(x, y):
@@ -2145,6 +2398,46 @@ SETTINGS = dict([(a,b) for (a, (b,c)) in
             merge_two_dicts(REQUIRED_SETTINGS, OPTIONAL_SETTINGS).items()])
 
 BAD_WU_MAX = 3 # Maximum allowed number of bad WUs
+
+def all_cpu_dies() -> dict[int, list[int]]:
+    "Get a list of dies and their cores"
+    if sys.platform != "linux":
+        # don't know what to do
+        return None
+
+    out_list = {}
+    cpu_sysfs = Path('/sys/devices/system/cpu')
+    core_re = re.compile(r'^cpu\d+$')
+    for entry in cpu_sysfs.iterdir():
+        if not entry.is_dir():
+            continue
+        if not core_re.match(entry.name):
+            continue
+
+        if not (entry / 'topology' / 'die_id').is_file():
+            # no topology support
+            return None
+
+        die_id = int((entry / 'topology' / 'die_id').read_text().rstrip())
+        if die_id in out_list:
+            continue
+
+        list_raw = (entry / 'topology' / 'die_cpus_list').read_text().rstrip()
+        list_parsed = []
+        for value in list_raw.split(','):
+            if '-' in value:
+                core_range = value.split('-')
+                assert len(core_range) == 2
+                start = int(core_range[0])
+                end = int(core_range[1])
+                list_parsed += list(range(start, end + 1))
+            else:
+                list_parsed.append(int(value))
+
+        out_list[die_id] = list_parsed
+
+    return out_list
+
 
 if __name__ == '__main__':
 
@@ -2189,6 +2482,8 @@ if __name__ == '__main__':
                                " Note that REGEXP cannot start with a dash")
         parser.add_option("--logdate", default=True, action='store_true',
                           help="Include ISO8601 format date in logging")
+        parser.add_option("--parallel", type=int,
+                          help="How many workunits to run in parallel")
 
         # Parse command line
         (options, args) = parser.parse_args()
@@ -2235,16 +2530,21 @@ if __name__ == '__main__':
                 raise ValueError("--ping requires --daemon or --logfile")
     # If no client id is given, we use <hostname>.<randomstr>
     if SETTINGS["CLIENTID"] is None:
-        import random
-        hostname = socket.gethostname()
-        random.seed()
-        random_str = hex(random.randrange(0, 2**32)).strip('0x')
-        SETTINGS["CLIENTID"] = "%s.%s" % (hostname, random_str)
+        if options.parallel is None:
+            import random
+            hostname = socket.gethostname()
+            random.seed()
+            random_str = hex(random.randrange(0, 2**32)).strip('0x')
+            SETTINGS["CLIENTID"] = "%s.%s" % (hostname, random_str)
+        else:
+            SETTINGS["CLIENTID"] = socket.gethostname()
 
     # If no working directory is given, we use <clientid>.work/
     if SETTINGS["WORKDIR"] is None:
         SETTINGS["WORKDIR"] = SETTINGS["CLIENTID"] + '.work/'
-    if not SETTINGS["BASEPATH"] is None:
+    elif options.parallel is not None:
+        logging.warning("workdir is ignored when parallel is specified, please set basepath instead")
+    if SETTINGS["BASEPATH"] is not None:
         SETTINGS["WORKDIR"] = os.path.join(SETTINGS["BASEPATH"],
                                            SETTINGS["WORKDIR"])
         SETTINGS["DLDIR"] = os.path.join(SETTINGS["BASEPATH"],
@@ -2252,6 +2552,8 @@ if __name__ == '__main__':
     # If no WU filename is given, we use "WU." + client id
     if SETTINGS["WU_FILENAME"] is None:
         SETTINGS["WU_FILENAME"] = "WU." + SETTINGS["CLIENTID"]
+    elif options.parallel is not None:
+        logging.warning("wu-filename is ignored when parallel is specified")
 
     SETTINGS["KEEPOLDRESULT"] = options.keepoldresult
     SETTINGS["NOSHA1CHECK"] = options.nosha1check
@@ -2259,6 +2561,7 @@ if __name__ == '__main__':
     SETTINGS["OVERRIDE"] = options.override
     SETTINGS["SINGLE"] = options.single
     SETTINGS["EXIT_ON_SERVER_GONE"] = options.exit_on_server_gone
+    options.parallel = options.parallel
 
     # Create download and working directories if they don't exist
     if not os.path.isdir(SETTINGS["DLDIR"]):
@@ -2316,36 +2619,71 @@ if __name__ == '__main__':
         # matter what.
         create_daemon(logfile = logfile)
 
-
-    # main control loop.
-    client_ok = True
-    bad_wu_counter = 0
-
     downloader = InputDownloader(SETTINGS, serv_pool, connector)
 
-    uploader = ResultUploader(SETTINGS, serv_pool, connector)
+    uploader = ResultUploader(SETTINGS, connector)
 
-    client = WorkunitClient(SETTINGS, serv_pool, downloader, uploader)
+    if options.parallel is None:
+        # run client, then exit
+        client = WorkunitClient(SETTINGS, downloader, uploader)
+        exit_code = client.run(options.single)
+        sys.exit(exit_code)
 
-    while client_ok:
-        try:
-            client_ok = client.process()
-        except WorkunitParseError:
-            bad_wu_counter += 1
-            if bad_wu_counter > BAD_WU_MAX:
-                logging.critical("Had %d bad workunit files. Aborting.", bad_wu_counter)
-                break
-            continue
-        except NoMoreServers as e:
-            logging.error(e)
-            sys.exit(1)
-        except WorkunitClientToFinish as e:
-            logging.info("Client finishing: %s. Bye.", e)
-            sys.exit(0)
-        except ServerGone as e:
-            sys.exit(0)
+    # set up parallel execution
+    affinity_groups = all_cpu_dies()
+    if affinity_groups is not None:
+        affinity_groups = list(affinity_groups.values())
+        logging.info('topology: found %d CPU dies', len(affinity_groups))
 
-        if options.single:
-            logging.info("Client processed its WU."
-                         " Finishing now as implied by --single")
-            sys.exit(0)
+    clients = []
+    uploader_thread = ResultUploaderThread(uploader)
+    uploader_thread.start()
+
+    for thread_idx in range(options.parallel):
+        client = ThreadedWorkunitClient(SETTINGS, downloader, uploader, thread_idx)
+        clients.append(client)
+        makedirs(client.workdir, exist_ok=True)
+
+    for client in clients:
+        # turns out the programs completely ignores affinity if hwloc exists, since
+        # they expect it on the command line
+        # if affinity_groups is not None:
+        #     client.set_affinity = affinity_groups[client.thread_idx % len(affinity_groups)]
+
+        client.start()
+        client.should_quit = options.single
+
+    def on_sigint(_signum, _frame):
+        logging.info("SIGINT received, exiting upon WU completion (hit ^C again to exit)")
+        for client in clients:
+            client.shutdown()
+        # restore original handler to exit immediately
+        signal.signal(signal.SIGINT, sigint_default_handler)
+
+        # WARNING WARNING WARNING
+        # this will leak processes!
+        # TODO: figure out how to fix that...
+
+    signal.signal(signal.SIGINT, on_sigint)
+
+    try:
+        for client in clients:
+            client.join()
+    except KeyboardInterrupt:
+        logging.info("SIGINT received, terminating immediately")
+        for client in clients:
+            if client._current_process is not None:
+                client._terminate_immediately = True
+                client._current_process.terminate()
+
+        # wait for terminate
+        for client in clients:
+            client.join()
+
+    logging.info("All clients exited, waiting for uploader...")
+
+    uploader_thread.shutdown()
+    uploader_thread.join()
+
+    logging.info("Client exiting")
+    sys.exit(0)
