@@ -1606,6 +1606,14 @@ class InputDownloader(object):
             else:
                 connfailed = 0
             
+            # TODO: is there a less bad way to do this?
+            if not hard_error and waiting_since < 3 and is_wu and 'No work available' in error_str:
+                # retry a few times for more work
+                logging.info("Waiting for server to add more workunits...")
+                time.sleep(1)
+                waiting_since += 1
+                continue
+
             if givemsg:
                 logging.error("Download failed%s, %s",
                               " with hard error" if hard_error else "",
