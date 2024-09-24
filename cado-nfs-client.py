@@ -36,6 +36,7 @@ import email.encoders
 import email.generator
 from string import Template
 from io import BytesIO
+from pathlib import Path
 import ssl
 import urllib.request as urllib_request
 import urllib.error as urllib_error
@@ -2220,6 +2221,7 @@ class ThreadedWorkunitClient(threading.Thread):
         self.settings = settings
         self.workunit = None
         self.should_quit = False
+        self.set_affinity = None
 
     def shutdown(self):
         self.should_quit = True
@@ -2260,6 +2262,11 @@ class ThreadedWorkunitClient(threading.Thread):
     
     def run(self):
         logging.info("Starting client %s", self.clientid)
+
+        # processes forked off from the current thread will inherit the CPU set
+        if self.set_affinity is not None:
+            os.sched_setaffinity(0, self.set_affinity)
+
         client_ok = True
         bad_wu_counter = 0
 
@@ -2354,6 +2361,46 @@ SETTINGS = dict([(a,b) for (a, (b,c)) in
             merge_two_dicts(REQUIRED_SETTINGS, OPTIONAL_SETTINGS).items()])
 
 BAD_WU_MAX = 3 # Maximum allowed number of bad WUs
+
+def all_cpu_dies() -> dict[int, list[int]]:
+    "Get a list of dies and their cores"
+    if sys.platform != "linux":
+        # don't know what to do
+        return None
+
+    out_list = {}    
+    cpu_sysfs = Path('/sys/devices/system/cpu')
+    core_re = re.compile(r'^cpu\d+$')
+    for entry in cpu_sysfs.iterdir():
+        if not entry.is_dir():
+            continue
+        if not core_re.match(entry.name):
+            continue
+
+        if not (entry / 'topology' / 'die_id').is_file():
+            # no topology support
+            return None
+
+        die_id = int((entry / 'topology' / 'die_id').read_text().rstrip())
+        if die_id in out_list:
+            continue
+
+        list_raw = (entry / 'topology' / 'die_cpus_list').read_text().rstrip()
+        list_parsed = []
+        for value in list_raw.split(','):
+            if '-' in value:
+                core_range = value.split('-')
+                assert len(core_range) == 2
+                start = int(core_range[0])
+                end = int(core_range[1])
+                list_parsed += list(range(start, end + 1))
+            else:
+                list_parsed.append(int(value))
+
+        out_list[die_id] = list_parsed
+
+    return out_list
+
 
 if __name__ == '__main__':
 
@@ -2546,6 +2593,11 @@ if __name__ == '__main__':
         sys.exit(exit_code)
 
     # set up parallel execution
+    affinity_groups = all_cpu_dies()
+    if affinity_groups is not None:
+        affinity_groups = list(affinity_groups.values())
+        logging.info('topology: found %d CPU dies', len(affinity_groups))
+
     clients = []
     uploader_thread = ResultUploaderThread(uploader)
     uploader_thread.start()
@@ -2556,16 +2608,21 @@ if __name__ == '__main__':
         makedirs(client.workdir, exist_ok=True)
     
     for client in clients:
+        if affinity_groups is not None:
+            client.set_affinity = affinity_groups[client.thread_idx % len(affinity_groups)]
+
         client.start()
 
-    # TODO: parallel
-    # TODO: make workdir after spawning parallel client
     def on_sigint(_signum, _frame):
         logging.info("SIGINT received, exiting upon WU completion (hit ^C again to exit)")
         for client in clients:
             client.shutdown()
         # restore original handler to exit immediately
         signal.signal(signal.SIGINT, sigint_default_handler)
+
+        # WARNING WARNING WARNING
+        # this will leak processes!
+        # TODO: figure out how to fix that...
 
     signal.signal(signal.SIGINT, on_sigint)
 
