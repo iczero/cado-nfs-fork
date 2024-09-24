@@ -2608,8 +2608,10 @@ if __name__ == '__main__':
         makedirs(client.workdir, exist_ok=True)
     
     for client in clients:
-        if affinity_groups is not None:
-            client.set_affinity = affinity_groups[client.thread_idx % len(affinity_groups)]
+        # turns out the programs completely ignores affinity if hwloc exists, since
+        # they expect it on the command line
+        # if affinity_groups is not None:
+        #     client.set_affinity = affinity_groups[client.thread_idx % len(affinity_groups)]
 
         client.start()
 
