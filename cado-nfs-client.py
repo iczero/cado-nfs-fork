@@ -1560,7 +1560,7 @@ class InputDownloader(object):
         if dlpath is None:
             dlpath_tmp = None
         else:
-            dlpath_tmp = "%s%d" % (dlpath, random.randint(0,2**30)^os.getpid())
+            dlpath_tmp = "%s.tmp%d" % (dlpath, random.randint(0,2**30)^os.getpid())
         while True:
             logging.info("spin=%d is_wu=%s blog=%d", spin, is_wu,
                     len(self.wu_backlog)+len(self.wu_backlog_alt))
@@ -2257,7 +2257,7 @@ class ThreadedWorkunitClient(threading.Thread):
 
         while client_ok:
             try:
-                client_ok = client.process()
+                client_ok = self.process()
             except WorkunitParseError:
                 bad_wu_counter += 1
                 if bad_wu_counter > BAD_WU_MAX:
@@ -2546,6 +2546,8 @@ if __name__ == '__main__':
         client = ThreadedWorkunitClient(SETTINGS, downloader, uploader, thread_idx)
         clients.append(client)
         makedirs(client.workdir, exist_ok=True)
+    
+    for client in clients:
         client.start()
 
     # TODO: parallel
