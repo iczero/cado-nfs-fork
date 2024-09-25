@@ -1,0 +1,13 @@
+[MASTER]
+disable=
+  C0103, # invalid-name, keeps wrongly triggering
+  C0114, # missing-module-docstring
+  C0115, # missing-class-docstring
+  C0116, # missing-function-docstring
+  W0702, # bare-except
+  C0415, # import-outside-toplevel
+  W0212, # protected-access
+  W0603, # global-statement
+
+[FORMAT]
+max-line-length=120

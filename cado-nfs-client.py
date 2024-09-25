@@ -1443,7 +1443,7 @@ class WorkunitWrapper(Workunit):
 #         # normal __str__ for workunits prints the text in full. In truth,
 #         # we don't need it.
 #         return self.get_id()
-# 
+#
     def get_peer(self):
         return self.peer
 
@@ -1606,7 +1606,7 @@ class InputDownloader(object):
                 connfailed += 1
             else:
                 connfailed = 0
-            
+
             # TODO: is there a less bad way to do this?
             if not hard_error and waiting_since < 3 and is_wu and 'No work available' in error_str:
                 # retry a few times for more work
@@ -1983,7 +1983,7 @@ class ResultUploader(object):
 
         mention_each = len(self.upload_backlog) > 1
         wait = float(self.settings["DOWNLOADRETRY"])
-    
+
         if not dedicated_thread:
             self.retry_all()
             # in dedicated_thread mode, the executor handles retry
@@ -2075,11 +2075,11 @@ class ResultUploaderThread(threading.Thread):
                 break
 
             # try not to spam retries too hard
-            retry_count = math.ceil(math.log2(len(self.uploader.to_retry) + 1))
+            retry_count = math.ceil(len(self.uploader.to_retry) ** 0.6)
             if retry_count > 0:
-                logging.info(f"Retrying {retry_count} uploads")
+                logging.info("Retrying %d uploads", retry_count)
             for _ in range(retry_count):
-                self.uploader.upload_backlog.append(self.to_retry.popleft())
+                self.uploader.upload_backlog.append(self.uploader.to_retry.popleft())
 
             self.uploader.process_uploads(dedicated_thread=True)
 
@@ -2098,7 +2098,7 @@ class ResultUploaderThread(threading.Thread):
         # we were told to exit, do final retry
         # we shouldn't receive any new jobs at this point
         last_retry_count = 0
-        while last_retry_count < 3:
+        while last_retry_count < 10:
             last_retry_count += 1
             self.uploader.retry_all()
             self.uploader.process_uploads(dedicated_thread=True)
@@ -2110,9 +2110,9 @@ class ResultUploaderThread(threading.Thread):
                 break
 
             time.sleep(5)
-        
+
         if len(self.uploader.to_retry) > 0:
-            logging.error(f"Giving up on {len(self.uploader.to_retry)} uploads:")
+            logging.error("Giving up on %d uploads:", len(self.uploader.to_retry))
             for p in self.uploader.to_retry:
                 logging.info("\t%s  -->  %s",
                              p.workunit.get_id(),
@@ -2133,7 +2133,7 @@ class WorkunitClient(object):
         return self.workunit.get("TERMINATE", None) is not None
 
     def process(self):
-        self.workunit = downloader.get_wu_full(self.settings["CLIENTID"], self.settings["WU_FILENAME"])
+        self.workunit = self.downloader.get_wu_full(self.settings["CLIENTID"], self.settings["WU_FILENAME"])
 
         if self.have_terminate_request():
             self.workunit.cleanup()
@@ -2185,7 +2185,7 @@ class WorkunitClient(object):
 
         while client_ok:
             try:
-                client_ok = client.process()
+                client_ok = self.process()
             except WorkunitParseError:
                 bad_wu_counter += 1
                 if bad_wu_counter > BAD_WU_MAX:
@@ -2230,7 +2230,7 @@ class ThreadedWorkunitClient(threading.Thread):
         return self.workunit.get("TERMINATE", None) is not None
 
     def process(self):
-        self.workunit = downloader.get_wu_full(self.clientid, f"WU.{self.clientid}")
+        self.workunit = self.downloader.get_wu_full(self.clientid, f"WU.{self.clientid}")
 
         if self.have_terminate_request():
             self.workunit.cleanup()
@@ -2259,7 +2259,7 @@ class ThreadedWorkunitClient(threading.Thread):
         self.workunit = None
 
         return True
-    
+
     def run(self):
         logging.info("Starting client %s", self.clientid)
 
@@ -2368,7 +2368,7 @@ def all_cpu_dies() -> dict[int, list[int]]:
         # don't know what to do
         return None
 
-    out_list = {}    
+    out_list = {}
     cpu_sysfs = Path('/sys/devices/system/cpu')
     core_re = re.compile(r'^cpu\d+$')
     for entry in cpu_sysfs.iterdir():
@@ -2606,7 +2606,7 @@ if __name__ == '__main__':
         client = ThreadedWorkunitClient(SETTINGS, downloader, uploader, thread_idx)
         clients.append(client)
         makedirs(client.workdir, exist_ok=True)
-    
+
     for client in clients:
         # turns out the programs completely ignores affinity if hwloc exists, since
         # they expect it on the command line
@@ -2614,6 +2614,7 @@ if __name__ == '__main__':
         #     client.set_affinity = affinity_groups[client.thread_idx % len(affinity_groups)]
 
         client.start()
+        client.should_quit = options.single
 
     def on_sigint(_signum, _frame):
         logging.info("SIGINT received, exiting upon WU completion (hit ^C again to exit)")
