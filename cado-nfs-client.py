@@ -1976,12 +1976,7 @@ class ResultUploader(object):
 
         logging.info("Uploading results: backlog has %d entries",
                      len(self.upload_backlog))
-        for p in self.upload_backlog:
-            logging.info("\t%s  -->  %s",
-                         p.workunit.get_id(),
-                         p.workunit.get_peer())
 
-        mention_each = len(self.upload_backlog) > 1
         wait = float(self.settings["DOWNLOADRETRY"])
 
         if not dedicated_thread:
@@ -2000,10 +1995,9 @@ class ResultUploader(object):
                               p.workunit.get_id())
                 p.cleanup()
                 continue
-            if mention_each:
-                logging.info("Attempt: %s  -->  %s",
-                             p.workunit.get_id(),
-                             p.workunit.get_peer())
+            logging.info("Attempt: %s  -->  %s",
+                         p.workunit.get_id(),
+                         p.workunit.get_peer())
             request, cafile = p.get_answer()
             url = request.get_full_url()
             conn = None
