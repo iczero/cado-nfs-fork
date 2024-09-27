@@ -1521,7 +1521,8 @@ class InputDownloader(object):
             options=None,
             is_wu=False,
             executable=False,
-            mandatory_server=None):
+            mandatory_server=None,
+            cancel_hook=None):
         """ gets a file from the server (of from one of the failover
         servers, for WUs), and wait until we succeed.
 
@@ -1563,6 +1564,11 @@ class InputDownloader(object):
         else:
             dlpath_tmp = "%s.tmp%d" % (dlpath, random.randint(0,2**30)^os.getpid())
         while True:
+            if callable(cancel_hook) and cancel_hook():
+                # caller can handle cancel and wants us to cancel
+                logging.info("caller requested cancel")
+                return None
+
             logging.info("spin=%d is_wu=%s blog=%d", spin, is_wu,
                     len(self.wu_backlog)+len(self.wu_backlog_alt))
             if cap and spin > max_loops:
@@ -1586,7 +1592,7 @@ class InputDownloader(object):
                 break
 
             if hard_error and self.exit_on_server_gone and self.server_pool.current_server_was_successful_once():
-                logging.error(f"Disabling {current_server} because of --exit-on-server-gone")
+                logging.error("Disabling %s because of --exit-on-server-gone", current_server)
                 try:
                     self.server_pool.disable_server(current_server)
                 except NoMoreServers:
@@ -1607,13 +1613,18 @@ class InputDownloader(object):
             else:
                 connfailed = 0
 
+            # the error is expected (e.g. "No work available"), do not increment failure counter
+            normal_error = False
+
             # TODO: is there a less bad way to do this?
-            if not hard_error and waiting_since < 3 and is_wu and 'No work available' in error_str:
-                # retry a few times for more work
-                logging.info("Waiting for server to add more workunits...")
-                time.sleep(1)
-                waiting_since += 1
-                continue
+            if not hard_error and is_wu and 'No work available' in error_str:
+                normal_error = True
+                if waiting_since < 3:
+                    # retry a few times for more work
+                    logging.info("Waiting for server to add more workunits...")
+                    time.sleep(1)
+                    waiting_since += 1
+                    continue
 
             if givemsg:
                 logging.error("Download failed%s, %s",
@@ -1639,7 +1650,7 @@ class InputDownloader(object):
                 continue
 
             # 4 means that we'll try 5 times.
-            if waiting_since >= 4 * wait:
+            if waiting_since >= 4 * wait and not normal_error:
                 if mandatory_server is None:
                     current_server = self.server_pool.change_server()
                     spin += 1
@@ -1678,8 +1689,8 @@ class InputDownloader(object):
                          options=None,
                          is_wu=False,
                          executable=False,
-                         mandatory_server=None
-                         ):
+                         mandatory_server=None,
+                         cancel_hook=None):
         """ Downloads a file if it does not exist already, from one of
         the servers configured for failover.
 
@@ -1749,7 +1760,8 @@ class InputDownloader(object):
             peer = self.get_file(urlpath, filename, options=options,
                                  is_wu=is_wu,
                                  executable=executable,
-                                 mandatory_server=mandatory_server)
+                                 mandatory_server=mandatory_server,
+                                 cancel_hook=cancel_hook)
             if peer is None:
                 if is_wu:
                     return None
@@ -1805,7 +1817,7 @@ class InputDownloader(object):
 
     # }}}
 
-    def _get_fresh_wu(self, clientid, wu_path):
+    def _get_fresh_wu(self, clientid, wu_path, cancel_hook):
         """
         returns a WorkunitWrapper.  We don't know whether the companion
         files are present at this point. There is still a possibility
@@ -1825,7 +1837,8 @@ class InputDownloader(object):
             peer = self.get_missing_file(url,
                                          wu_path,
                                          options=options,
-                                         is_wu=True)
+                                         is_wu=True,
+                                         cancel_hook=cancel_hook)
 
             if peer is None:
                 # could not download a WU...
@@ -1865,7 +1878,7 @@ class InputDownloader(object):
 
         return workunit
 
-    def _get_wu(self, clientid, wu_path_fresh):
+    def _get_wu(self, clientid, wu_path_fresh, cancel_hook):
         if self.wu_backlog:
             logging.info("Current backlog of half-downloaded WUs: %s",
                     ", ".join([w.get_id() for w in self.wu_backlog]))
@@ -1883,21 +1896,25 @@ class InputDownloader(object):
                 logging.info("Re-attempting previously downloaded workunit %s",
                              workunit.get_id())
                 return workunit
-        return self._get_fresh_wu(clientid, wu_path_fresh)
+        return self._get_fresh_wu(clientid, wu_path_fresh, cancel_hook)
 
-    def _get_wu_full_inner(self, clientid, wu_filename_fresh):
+    def _get_wu_full_inner(self, clientid, wu_filename_fresh, cancel_hook):
         """
         returns a workunit object, together with the identification of
         the origin server, and an exclusive file handle on the WU.
         All companion files of the workunit object are
         guaranteed to be there when this function returns.
+        Note: the cancel_hook should always return True after it first returns True
         """
 
         self.wu_backlog_alt = []
         wu_path_fresh = os.path.join(self.settings["DLDIR"], wu_filename_fresh)
         while True:
-            workunit = self._get_wu(clientid, wu_path_fresh)
+            workunit = self._get_wu(clientid, wu_path_fresh, cancel_hook)
             if workunit is None:
+                if callable(cancel_hook) and cancel_hook():
+                    return None
+
                 self.wu_backlog += self.wu_backlog_alt
                 self.wu_backlog_alt = []
                 continue
@@ -1925,11 +1942,11 @@ class InputDownloader(object):
         self.wu_backlog_alt = []
         return workunit
 
-    def get_wu_full(self, clientid, wu_filename_fresh):
+    def get_wu_full(self, clientid, wu_filename_fresh, cancel_hook = None):
         "Get a workunit with exclusive lock"
         self.lock.acquire()
         try:
-            return self._get_wu_full_inner(clientid, wu_filename_fresh)
+            return self._get_wu_full_inner(clientid, wu_filename_fresh, cancel_hook)
         finally:
             self.lock.release()
 # }}}
@@ -2224,7 +2241,7 @@ class ThreadedWorkunitClient(threading.Thread):
         return self.workunit.get("TERMINATE", None) is not None
 
     def process(self):
-        self.workunit = self.downloader.get_wu_full(self.clientid, f"WU.{self.clientid}")
+        self.workunit = self.downloader.get_wu_full(self.clientid, f"WU.{self.clientid}", lambda: self.should_quit)
 
         if self.have_terminate_request():
             self.workunit.cleanup()
