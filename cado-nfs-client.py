@@ -8,6 +8,9 @@
 # pylint: disable=too-few-public-methods
 # pylint: disable=import-error
 # pylint: disable=wrong-import-position
+# pylint: disable=missing-module-docstring
+# pylint: disable=missing-class-docstring
+# pylint: disable=missing-function-docstring
 
 # {{{ libs
 import sys
@@ -697,6 +700,12 @@ def run_command(command, stdin=None, print_error=True, **kwargs):
                              **kwargs)
 
     logging.info ("[%s] Subprocess has PID %d", time.asctime(), child.pid)
+    # "thread-local storage"
+    current_thread = threading.current_thread()
+    if isinstance(current_thread, ThreadedWorkunitClient):
+        current_thread._current_process = child
+    else:
+        current_thread = None
 
     # Wait for command to finish executing, capturing stdout and stderr
     # in output tuple
@@ -710,6 +719,9 @@ def run_command(command, stdin=None, print_error=True, **kwargs):
         logging.error("[%s] Terminated command resulted in exit code %d",
             time.asctime(), child.returncode)
         raise # Re-raise KeyboardInterrupt to terminate cado-nfs-client.py
+    finally:
+        current_thread._current_process = None
+        current_thread._terminate_if_requested()
 
     if print_error and child.returncode != 0:
         logging.error("Command resulted in exit code %d", child.returncode)
@@ -2233,9 +2245,18 @@ class ThreadedWorkunitClient(threading.Thread):
         self.workunit = None
         self.should_quit = False
         self.set_affinity = None
+        # set by run_command if the current thread is a ThreadedWorkunitClient
+        self._current_process = None
+        # set True to raise KeyboardInterrupt to whoever checks
+        self._terminate_immediately = False
 
     def shutdown(self):
         self.should_quit = True
+
+    def _terminate_if_requested(self):
+        assert threading.current_thread() is self
+        if self._terminate_immediately:
+            raise KeyboardInterrupt()
 
     def have_terminate_request(self):
         return self.workunit.get("TERMINATE", None) is not None
@@ -2640,8 +2661,19 @@ if __name__ == '__main__':
 
     signal.signal(signal.SIGINT, on_sigint)
 
-    for client in clients:
-        client.join()
+    try:
+        for client in clients:
+            client.join()
+    except KeyboardInterrupt:
+        logging.info("SIGINT received, terminating immediately")
+        for client in clients:
+            if client._current_process is not None:
+                client._terminate_immediately = True
+                client._current_process.terminate()
+
+        # wait for terminate
+        for client in clients:
+            client.join()
 
     logging.info("All clients exited, waiting for uploader...")
 
