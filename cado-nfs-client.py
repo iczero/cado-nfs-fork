@@ -2244,6 +2244,8 @@ class ThreadedWorkunitClient(threading.Thread):
         self.settings = settings
         self.workunit = None
         self.should_quit = False
+        # run a single workunit only, then exit
+        self.single_only = False
         self.set_affinity = None
         # set by run_command if the current thread is a ThreadedWorkunitClient
         self._current_process = None
@@ -2327,7 +2329,7 @@ class ThreadedWorkunitClient(threading.Thread):
                 logging.info("Client %s server gone: %s, exiting", self.clientid, e)
                 return
 
-            if self.should_quit:
+            if self.should_quit or self.single_only:
                 logging.info("Client %s WU finished, exiting as requested", self.clientid)
                 return
 # }}}
@@ -2651,7 +2653,7 @@ if __name__ == '__main__':
         #     client.set_affinity = affinity_groups[client.thread_idx % len(affinity_groups)]
 
         client.start()
-        client.should_quit = options.single
+        client.single_only = options.single
 
     def on_sigint(_signum, _frame):
         logging.info("SIGINT received, exiting upon WU completion (hit ^C again to exit)")
