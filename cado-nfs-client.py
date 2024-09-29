@@ -2484,6 +2484,8 @@ if __name__ == '__main__':
                           help="Include ISO8601 format date in logging")
         parser.add_option("--parallel", type=int,
                           help="How many workunits to run in parallel")
+        parser.add_option("--local-bindir", default=False, action="store_true",
+                          help="Automatically detect local bindir")
 
         # Parse command line
         (options, args) = parser.parse_args()
@@ -2523,6 +2525,27 @@ if __name__ == '__main__':
 
     options = parse_cmdline()
 
+    loglevel = getattr(logging, SETTINGS["LOGLEVEL"].upper(), None)
+    if not isinstance(loglevel, int):
+        raise ValueError('Invalid log level: ' + SETTINGS["LOGLEVEL"])
+    logfilename = SETTINGS["LOGFILE"]
+    if options.daemon and logfilename is None:
+        logfilename = "%s/%s.log" % (SETTINGS["WORKDIR"], SETTINGS["CLIENTID"])
+        SETTINGS["LOGFILE"] = logfilename
+
+    logfile = None if logfilename is None else open(logfilename, "a", encoding="utf-8")
+    logging.basicConfig(level=loglevel)
+    if options.logdate:
+        logging.basicConfig(
+            format='%(asctime)s - %(levelname)s:%(name)s:%(message)s',
+            level=loglevel)
+    else:
+        logging.basicConfig(level=loglevel)
+    if logfile:
+        logging.getLogger().addHandler(logging.StreamHandler(logfile))
+
+    abort_on_python2()
+
     if options.ping != None:
         if SETTINGS["CLIENTID"] is None:
                 raise ValueError("--ping requires --clientid")
@@ -2538,6 +2561,18 @@ if __name__ == '__main__':
             SETTINGS["CLIENTID"] = "%s.%s" % (hostname, random_str)
         else:
             SETTINGS["CLIENTID"] = socket.gethostname()
+
+    if options.local_bindir:
+        # TODO: local_bindir
+        if SETTINGS["BINDIR"] is not None:
+            logging.error("--bindir is specified, ignoring --local-bindir")
+        else:
+            if os.path.isdir(pathdict["bin"]):
+                SETTINGS["BINDIR"] = pathdict["bin"]
+                logging.info("detected bindir to be %s", pathdict["bin"])
+            else:
+                logging.error("cannot find bindir (--local-bindir was specified), "
+                              "defaulting to binaries from server")
 
     # If no working directory is given, we use <clientid>.work/
     if SETTINGS["WORKDIR"] is None:
@@ -2571,14 +2606,6 @@ if __name__ == '__main__':
 
     # print (str(SETTINGS))
 
-    loglevel = getattr(logging, SETTINGS["LOGLEVEL"].upper(), None)
-    if not isinstance(loglevel, int):
-        raise ValueError('Invalid log level: ' + SETTINGS["LOGLEVEL"])
-    logfilename = SETTINGS["LOGFILE"]
-    if options.daemon and logfilename is None:
-        logfilename = "%s/%s.log" % (SETTINGS["WORKDIR"], SETTINGS["CLIENTID"])
-        SETTINGS["LOGFILE"] = logfilename
-
     if options.ping != None:
         if pid_exists(options.ping):
             sys.exit(0)
@@ -2591,20 +2618,8 @@ if __name__ == '__main__':
                 sys.stderr.write("CLIENT ERROR: " + l)
         sys.exit(1)
 
-    logfile = None if logfilename is None else open(logfilename, "a")
-    logging.basicConfig(level=loglevel)
-    if options.logdate:
-        logging.basicConfig(
-            format='%(asctime)s - %(levelname)s:%(name)s:%(message)s',
-            level=loglevel)
-    else:
-        logging.basicConfig(level=loglevel)
-    if logfile:
-        logging.getLogger().addHandler(logging.StreamHandler(logfile))
     logging.info("Starting client %s", SETTINGS["CLIENTID"])
     logging.info("Python version is %d.%d.%d", *sys.version_info[0:3])
-
-    abort_on_python2()
 
     if FixedBytesGenerator != candidates_for_BytesGenerator[0]:
         logging.info("Using work-around %s for buggy BytesGenerator",
