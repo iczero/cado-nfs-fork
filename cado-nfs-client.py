@@ -721,7 +721,7 @@ def run_command(command, stdin=None, print_error=True, **kwargs):
         raise # Re-raise KeyboardInterrupt to terminate cado-nfs-client.py
     finally:
         current_thread._current_process = None
-        current_thread._terminate_if_requested()
+        current_thread._terminate_immediately_if_requested()
 
     if print_error and child.returncode != 0:
         logging.error("Command resulted in exit code %d", child.returncode)
@@ -1999,18 +1999,12 @@ class ResultUploader(object):
             charset = "latin-1"
         return charset
 
-    def process_uploads(self, dedicated_thread = False):
+    def process_uploads(self):
         if len(self.upload_backlog) == 0:
             return
 
         logging.info("Uploading results: backlog has %d entries",
                      len(self.upload_backlog))
-
-        wait = float(self.settings["DOWNLOADRETRY"])
-
-        if not dedicated_thread:
-            self.retry_all()
-            # in dedicated_thread mode, the executor handles retry
 
         while True:
             try:
@@ -2031,34 +2025,13 @@ class ResultUploader(object):
             url = request.get_full_url()
             conn = None
             waiting_since = 0
-            while True:
-                conn, error_str, hard_error = self.connector._urlopen(
-                    request, cafile=cafile)
-                if conn:
-                    break
-                logging.error("Upload failed, %s", error_str)
-                if not dedicated_thread:
-                    if waiting_since > 0:
-                        logging.error("Waiting %s seconds before retrying"
-                                      " (I have been waiting for %s seconds)",
-                                      wait, waiting_since)
-                    else:
-                        logging.error("Waiting %s seconds before retrying",
-                                      wait)
-                    time.sleep(wait)
-                    waiting_since += wait
-                    if waiting_since >= 4 * wait:
-                        logging.error("Giving up on this upload,"
-                                      " will retry later")
-                        self.to_retry.append(p)
-                        break
-                else:
-                    # just wait until we are woken up again
-                    logging.error("... will try again later")
-                    self.to_retry.append(p)
-                    break
+            conn, error_str, hard_error = self.connector._urlopen(
+                request, cafile=cafile)
             if not conn:
-                # we've appended p to the new backlog at this point.
+                logging.error("Upload failed, %s", error_str)
+                # just wait until we are woken up again
+                logging.error("... will try again later")
+                self.to_retry.append(p)
                 continue
             if waiting_since > 0:
                 logging.info("Opened URL %s after %s seconds wait",
@@ -2085,7 +2058,6 @@ class ResultUploaderThread(threading.Thread):
         self.should_quit = True
         self.uploader.queue_event.set()
 
-    # used only when the ResultUploader is running in its own thread
     def run(self):
         logging.info("Started result uploader thread")
         retry_wait = float(self.uploader.settings["DOWNLOADRETRY"])
@@ -2104,7 +2076,7 @@ class ResultUploaderThread(threading.Thread):
             for _ in range(retry_count):
                 self.uploader.upload_backlog.append(self.uploader.to_retry.popleft())
 
-            self.uploader.process_uploads(dedicated_thread=True)
+            self.uploader.process_uploads()
 
             self.uploader.queue_event.clear()
             if len(self.uploader.upload_backlog) > 0:
@@ -2124,7 +2096,7 @@ class ResultUploaderThread(threading.Thread):
         while last_retry_count < 10:
             last_retry_count += 1
             self.uploader.retry_all()
-            self.uploader.process_uploads(dedicated_thread=True)
+            self.uploader.process_uploads()
 
             # everything should either be done or in to_retry
             assert len(self.uploader.upload_backlog) == 0
@@ -2145,133 +2117,56 @@ class ResultUploaderThread(threading.Thread):
 # }}}
 
 # {{{ WorkunitClient -- gets one WU, runs it, schedules its upload.
-class WorkunitClient(object):
-    def __init__(self, settings, downloader, uploader):
-        self.downloader = downloader
-        self.uploader = uploader
-        self.settings = settings
-        self.workunit = None
-
-    def have_terminate_request(self):
-        return self.workunit.get("TERMINATE", None) is not None
-
-    def process(self):
-        self.workunit = self.downloader.get_wu_full(self.settings["CLIENTID"], self.settings["WU_FILENAME"])
-
-        if self.have_terminate_request():
-            self.workunit.cleanup()
-            logging.info("Received TERMINATE, exiting")
-            return False
-
-        processor = WorkunitProcessor(self.workunit, self.settings, self.settings["CLIENTID"],
-                                      self.settings["WORKDIR"])
-        # TODO: a select loop, maybe ? We could handle the pending
-        # uploads, maybe.
-        processor.run_commands()
-        # to check the return value of the above command, change the previous
-        # line to ret = processor.run_commands(), and there is an error if
-        # ret is false (if not ret).
-        # Then we can search for a particular string in stderr as follows:
-        # ret = processor.run_commands()
-        # if not ret and re.search("xyx", str(processor.stdio["stderr"][0])):
-        #    output_something_to_some_log_file
-        #    sys.exit(1)
-        # this is useful if a given error always happens on a given machine
-
-        processor.prepare_answer()
-
-        # Transfer ownership of "processor" to the schedule_upload
-        # control flow.
-        self.uploader.schedule_upload(processor)
-
-        # And trigger the upload code now.
-        self.uploader.process_uploads()
-
-        self.workunit.cleanup()
-        self.workunit = None
-
-        return True
-
-    def run(self, single = False):
-        client_ok = True
-        bad_wu_counter = 0
-        exit_on_complete = False
-
-        def on_sigint(_signum, _frame):
-            nonlocal exit_on_complete
-            logging.info("SIGINT received, exiting upon WU completion (hit ^C again to exit)")
-            exit_on_complete = True
-            # restore original handler to exit immediately
-            signal.signal(signal.SIGINT, sigint_default_handler)
-
-        signal.signal(signal.SIGINT, on_sigint)
-
-        while client_ok:
-            try:
-                client_ok = self.process()
-            except WorkunitParseError:
-                bad_wu_counter += 1
-                if bad_wu_counter > BAD_WU_MAX:
-                    logging.critical("Had %d bad workunit files. Aborting.", bad_wu_counter)
-                    return 1
-                continue
-            except NoMoreServers as e:
-                logging.error(e)
-                return 1
-            except WorkunitClientToFinish as e:
-                logging.info("Client finishing: %s. Bye.", e)
-                return 0
-            except ServerGone as e:
-                return 0
-
-            if single:
-                logging.info("Client processed its WU."
-                            " Finishing now as implied by --single")
-                return 0
-            if exit_on_complete:
-                logging.info("WU finished, exiting as requested (SIGINT)")
-                return 0
-
 class ThreadedWorkunitClient(threading.Thread):
-    def __init__(self, settings, downloader, uploader, thread_idx):
-        clientid_base = settings["CLIENTID"]
-        self.clientid = f"{clientid_base}.p{thread_idx}"
-        self.thread_idx = thread_idx
+    def __init__(self, settings, downloader, uploader, clientid, workdir, wu_filename=None):
+        self.clientid = clientid
         super().__init__(name="Worker " + self.clientid)
-        self.workdir = os.path.join(SETTINGS["BASEPATH"], self.clientid + '.work/')
+        self.workdir = workdir
         self.downloader = downloader
         self.uploader = uploader
         self.settings = settings
+        if wu_filename is not None:
+            self.wu_filename = wu_filename
+        else:
+            self.wu_filename = f"WU.{self.clientid}"
+
         self.workunit = None
         self.should_quit = False
         # run a single workunit only, then exit
         self.single_only = False
-        self.set_affinity = None
         # set by run_command if the current thread is a ThreadedWorkunitClient
         self._current_process = None
         # set True to raise KeyboardInterrupt to whoever checks
         self._terminate_immediately = False
 
     def shutdown(self):
+        "Request shutdown after the current workunit is done"
         self.should_quit = True
 
-    def _terminate_if_requested(self):
+    def terminate_immediately(self):
+        "Attempt to terminate this client immediately"
+        self._terminate_immediately = True
+        if self._current_process is not None:
+            self._current_process.terminate()
+
+    def _terminate_immediately_if_requested(self):
         assert threading.current_thread() is self
         if self._terminate_immediately:
             raise KeyboardInterrupt()
 
-    def have_terminate_request(self):
+    def have_server_terminate_request(self):
         return self.workunit.get("TERMINATE", None) is not None
 
     def process(self):
-        self.workunit = self.downloader.get_wu_full(self.clientid, f"WU.{self.clientid}",
-                                                    lambda: self.should_quit)
+        self.workunit = self.downloader.get_wu_full(self.clientid, self.wu_filename,
+                                                    cancel_hook=lambda: self.should_quit)
 
-        if self.workunit is None and self.should_quit:
+        if self.workunit is None:
             # cancelled while fetching new workunit
+            assert self.should_quit
             return False
 
-        if self.have_terminate_request():
+        if self.have_server_terminate_request():
             self.workunit.cleanup()
             logging.info("Client %s received TERMINATE, exiting", self.clientid)
             return False
@@ -2301,10 +2196,6 @@ class ThreadedWorkunitClient(threading.Thread):
 
     def run(self):
         logging.info("Starting client %s", self.clientid)
-
-        # processes forked off from the current thread will inherit the CPU set
-        if self.set_affinity is not None:
-            os.sched_setaffinity(0, self.set_affinity)
 
         client_ok = True
         bad_wu_counter = 0
@@ -2401,48 +2292,8 @@ SETTINGS = dict([(a,b) for (a, (b,c)) in
 
 BAD_WU_MAX = 3 # Maximum allowed number of bad WUs
 
-def all_cpu_dies() -> dict[int, list[int]]:
-    "Get a list of dies and their cores"
-    if sys.platform != "linux":
-        # don't know what to do
-        return None
 
-    out_list = {}
-    cpu_sysfs = Path('/sys/devices/system/cpu')
-    core_re = re.compile(r'^cpu\d+$')
-    for entry in cpu_sysfs.iterdir():
-        if not entry.is_dir():
-            continue
-        if not core_re.match(entry.name):
-            continue
-
-        if not (entry / 'topology' / 'die_id').is_file():
-            # no topology support
-            return None
-
-        die_id = int((entry / 'topology' / 'die_id').read_text().rstrip())
-        if die_id in out_list:
-            continue
-
-        list_raw = (entry / 'topology' / 'die_cpus_list').read_text().rstrip()
-        list_parsed = []
-        for value in list_raw.split(','):
-            if '-' in value:
-                core_range = value.split('-')
-                assert len(core_range) == 2
-                start = int(core_range[0])
-                end = int(core_range[1])
-                list_parsed += list(range(start, end + 1))
-            else:
-                list_parsed.append(int(value))
-
-        out_list[die_id] = list_parsed
-
-    return out_list
-
-
-if __name__ == '__main__':
-
+def main():
     def parse_cmdline():
         # Create command line parser from the keys in SETTINGS
         parser = optparse.OptionParser()
@@ -2551,6 +2402,9 @@ if __name__ == '__main__':
                                            SETTINGS["WORKDIR"])
         SETTINGS["DLDIR"] = os.path.join(SETTINGS["BASEPATH"],
                                          SETTINGS["DLDIR"])
+    elif options.parallel is not None:
+        # --parallel uses basedir to generate per-worker work directories
+        SETTINGS["BASEPATH"] = "."
     # If no WU filename is given, we use "WU." + client id
     if SETTINGS["WU_FILENAME"] is None:
         SETTINGS["WU_FILENAME"] = "WU." + SETTINGS["CLIENTID"]
@@ -2568,8 +2422,6 @@ if __name__ == '__main__':
     # Create download and working directories if they don't exist
     if not os.path.isdir(SETTINGS["DLDIR"]):
         makedirs(SETTINGS["DLDIR"], exist_ok=True)
-    if not os.path.isdir(SETTINGS["WORKDIR"]):
-        makedirs(SETTINGS["WORKDIR"], exist_ok=True)
 
     # print (str(SETTINGS))
 
@@ -2625,35 +2477,33 @@ if __name__ == '__main__':
 
     uploader = ResultUploader(SETTINGS, connector)
 
-    if options.parallel is None:
-        # run client, then exit
-        client = WorkunitClient(SETTINGS, downloader, uploader)
-        exit_code = client.run(options.single)
-        sys.exit(exit_code)
-
-    # set up parallel execution
-    affinity_groups = all_cpu_dies()
-    if affinity_groups is not None:
-        affinity_groups = list(affinity_groups.values())
-        logging.info('topology: found %d CPU dies', len(affinity_groups))
-
     clients = []
     uploader_thread = ResultUploaderThread(uploader)
+    # if someone hits ctrl-c enough times to quit the main thread, don't hang around
+    uploader_thread.daemon = True
     uploader_thread.start()
 
-    for thread_idx in range(options.parallel):
-        client = ThreadedWorkunitClient(SETTINGS, downloader, uploader, thread_idx)
+    if options.parallel is not None:
+        clientid_base = SETTINGS["CLIENTID"]
+        for thread_idx in range(options.parallel):
+            clientid = f"{clientid_base}.p{thread_idx}"
+            workdir = os.path.join(SETTINGS["BASEPATH"], clientid + '.work/')
+            client = ThreadedWorkunitClient(SETTINGS, downloader, uploader,
+                                            clientid=clientid, workdir=workdir)
+            clients.append(client)
+            makedirs(client.workdir, exist_ok=True)
+    else:
+        client = ThreadedWorkunitClient(SETTINGS, downloader, uploader,
+                                        clientid=SETTINGS["CLIENTID"],
+                                        workdir=SETTINGS["WORKDIR"],
+                                        wu_filename=SETTINGS["WU_FILENAME"])
+        makedirs(SETTINGS["WORKDIR"], exist_ok=True)
         clients.append(client)
-        makedirs(client.workdir, exist_ok=True)
 
     for client in clients:
-        # turns out the programs completely ignores affinity if hwloc exists, since
-        # they expect it on the command line
-        # if affinity_groups is not None:
-        #     client.set_affinity = affinity_groups[client.thread_idx % len(affinity_groups)]
-
-        client.start()
         client.single_only = options.single
+        client.daemon = True
+        client.start()
 
     def on_sigint(_signum, _frame):
         logging.info("SIGINT received, exiting upon WU completion (hit ^C again to exit)")
@@ -2661,10 +2511,6 @@ if __name__ == '__main__':
             client.shutdown()
         # restore original handler to exit immediately
         signal.signal(signal.SIGINT, sigint_default_handler)
-
-        # WARNING WARNING WARNING
-        # this will leak processes!
-        # TODO: figure out how to fix that...
 
     signal.signal(signal.SIGINT, on_sigint)
 
@@ -2674,9 +2520,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logging.info("SIGINT received, terminating immediately")
         for client in clients:
-            if client._current_process is not None:
-                client._terminate_immediately = True
-                client._current_process.terminate()
+            client.terminate_immediately()
 
         # wait for terminate
         for client in clients:
@@ -2689,3 +2533,6 @@ if __name__ == '__main__':
 
     logging.info("Client exiting")
     sys.exit(0)
+
+if __name__ == '__main__':
+    main()
