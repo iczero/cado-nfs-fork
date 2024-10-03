@@ -1047,6 +1047,10 @@ class DoesImport(DoesLogging, cadoparams.UseParameters, Runnable,
         for filename in filenames:
             self.import_one_file(filename)
 
+        if isinstance(self, HasState):
+            self.logger.info("Do database commit")
+            self.db_connection.commit()
+
     def did_import(self):
         return self._did_import
 
@@ -3600,9 +3604,9 @@ class SievingTask(ClientServerTask, DoesImport, FilesCreator, HasStatistics,
             self.forget_output_filenames([filename], commit=True)
         filename_with_stats_extension = filename + ".stats.txt"
         if os.path.isfile(filename_with_stats_extension):
-            self.add_file(filename, filename_with_stats_extension)
+            self.add_file(filename, filename_with_stats_extension, commit=False)
         else:
-            self.add_file(filename)
+            self.add_file(filename, commit=False)
 
     def get_statistics_as_strings(self):
         strings = ["Total number of relations: %d" % self.get_nrels()]
