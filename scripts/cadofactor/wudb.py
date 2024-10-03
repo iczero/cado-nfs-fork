@@ -1399,6 +1399,8 @@ class WuAccess(object): # {
         self.mapper.table.update(cursor, d, eq={pk:data[pk]})
         self.commit(commit)
 
+        logger.info("Verified workunit %s from client %s", wuid, data["resultclient"])
+
         cursor.close()
         return True
 
