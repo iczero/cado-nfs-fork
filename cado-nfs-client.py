@@ -163,6 +163,9 @@ sys.path.append(pathdict["pylib"])
 from workunit import Workunit
 # }}}
 
+# timeout for urllib requests
+DEFAULT_REQUEST_TIMEOUT = 180
+
 # grab the default SIGINT handler (which raises KeyboardInterrupt)
 sigint_default_handler = signal.getsignal(signal.SIGINT)
 
@@ -748,7 +751,7 @@ class HTTP_connector(object):
                             timeout, filename)
 
     @staticmethod
-    def _urlopen_maybe_https(request, cafile=None, check_hostname=True):
+    def _urlopen_maybe_https(request, cafile=None, check_hostname=True, timeout=DEFAULT_REQUEST_TIMEOUT):
         """ Treat requests for HTTPS differently depending on whether we are
         on Python 2 or Python 3.
         """
@@ -775,12 +778,12 @@ class HTTP_connector(object):
             context.check_hostname = bool(check_hostname)
             context.load_verify_locations(cafile=cafile)
 
-            return urllib_request.urlopen(request, context=context)
+            return urllib_request.urlopen(request, context=context, timeout=timeout)
 
         # If we are not using HTTPS, we can just let urllib do it,
         # and there is no need for a cafile parameter (which Python 2
         # urlopen() does not accept)
-        return urllib_request.urlopen(request)
+        return urllib_request.urlopen(request, timeout=timeout)
 
     def _urlopen(self, request, cafile=None):
         """ Wrapper around urllib2.urlopen
@@ -889,7 +892,8 @@ def get_ssl_certificate(server, port=443, retry=False, retrytime=0):
         try:
             cert = ssl.get_server_certificate((server, int(port)),
                                               ssl_version=ssl.PROTOCOL_TLSv1_2,
-                                              ca_certs=None)
+                                              ca_certs=None,
+                                              timeout=DEFAULT_REQUEST_TIMEOUT)
             return cert
         except socket.error as err:
             if err.errno != errno.ECONNREFUSED:
